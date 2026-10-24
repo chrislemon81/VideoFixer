@@ -118,7 +118,7 @@ class RepairTests(unittest.TestCase):
 
     def test_mp4_hevc_inband_truncated(self):
         src = make(self.tmp / "hevc.mp4", ["-c:v", "libx265", "-x265-params", "repeat-headers=1:log-level=error",
-                                           "-tag:v", "hvc1"], ["-c:a", "aac"])
+                                           "-tag:v", "hev1"], ["-c:a", "aac"])
         truncate(src, 0.85)
         self.repair(src, DURATION * 0.6, audio=False)
 
