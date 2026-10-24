@@ -63,6 +63,7 @@ Videos that already look fine are skipped automatically (you can untick that).
 
 | Problem | What to try |
 |---|---|
+| A video is skipped as "looks fine" but still won't play | Untick **Skip videos that already look fine** and run again; it then gets rebuilt anyway. |
 | "decoder settings (SPS/PPS) are missing" | Choose a **good video from the same camera** (step 3) and run again. |
 | Fixed video is much shorter than expected | Tick **Deep scan** and run again. |
 | Plays too fast or too slow | Type the camera's frame rate (usually 30, 25 or 60) in **frame rate**. |

@@ -1068,6 +1068,106 @@ def parse_avi_header(buf, size: int) -> dict:
     return out
 
 
+def avi_index_problems(buf, size: int) -> List[str]:
+    """Check an AVI's structure and index the way players such as VLC do.
+    Returns a list of problems; an empty list means the file is intact."""
+    if bytes(buf[0:4]) != b"RIFF" or bytes(buf[8:12]) != b"AVI ":
+        return ["the AVI header is missing or damaged"]
+    problems = []
+    riff_size = u32le(buf, 4)
+    if riff_size == 0:
+        problems.append("the file header was never finished (recording was interrupted)")
+    elif 8 + riff_size > size:
+        problems.append("the file is shorter than its header says (it was cut off)")
+    end = min(8 + riff_size, size) if riff_size else size
+
+    # files over 1 GB continue in further 'RIFF AVIX' sections, which must all be complete
+    pos = 8 + riff_size + (riff_size & 1) if riff_size else size
+    while pos + 12 <= size:
+        sz = u32le(buf, pos + 4)
+        if bytes(buf[pos:pos + 4]) != b"RIFF" or bytes(buf[pos + 8:pos + 12]) != b"AVIX":
+            if any(buf[pos:min(size, pos + 4096)]):
+                problems.append(f"there is damaged data after offset {pos}")
+            break
+        if sz == 0 or pos + 8 + sz > size:
+            problems.append("the last part of the file is cut off or unfinished")
+            break
+        pos += 8 + sz + (sz & 1)
+
+    hdrl = opendml = False
+    movi = idx1 = None
+    pos = 12
+    while pos + 8 <= end:
+        cid, sz = bytes(buf[pos:pos + 4]), u32le(buf, pos + 4)
+        if not is_fourcc(cid):
+            problems.append(f"the file structure is damaged at offset {pos}")
+            break
+        if cid == b"LIST" and pos + 12 <= size:
+            ltype = bytes(buf[pos + 8:pos + 12])
+            if ltype == b"hdrl":
+                hdrl = True
+                opendml = buf.find(b"indx", pos, min(pos + 8 + sz, size)) >= 0
+            elif ltype == b"movi":
+                movi = (pos + 8, pos + 8 + sz)          # movi[0] = position of the 'movi' tag
+        elif cid == b"idx1":
+            idx1 = (pos + 8, pos + 8 + sz)
+        if sz == 0 and cid == b"LIST":
+            break
+        pos += 8 + sz + (sz & 1)
+    if not hdrl:
+        problems.append("the AVI header (hdrl) is missing")
+    if movi is None:
+        problems.append("the video data list (movi) is missing")
+        return problems
+    if movi[1] - movi[0] <= 4:
+        problems.append("the video data list was never finished (recording was interrupted)")
+        movi = (movi[0], size)
+    elif movi[1] > size:
+        problems.append("the video data is cut off")
+
+    # every chunk actually in the video data list
+    chunks = []
+    p, mend = movi[0] + 4, min(movi[1], size)
+    while p + 8 <= mend:
+        cid, sz = bytes(buf[p:p + 4]), u32le(buf, p + 4)
+        if cid == b"LIST" and p + 12 <= mend:
+            p += 12
+            continue
+        if not is_fourcc(cid) or p + 8 + sz > mend:
+            problems.append(f"the video data is damaged at offset {p}")
+            break
+        if AVI_STREAM_RE.fullmatch(cid):
+            chunks.append(p)
+        p += 8 + sz + (sz & 1)
+
+    if idx1 is None:
+        if not opendml:
+            problems.append("the index (idx1) is missing")
+        return problems
+    if idx1[1] > size:
+        problems.append("the index (idx1) is cut off")
+    data = bytes(buf[idx1[0]:min(idx1[1], size)])
+    entries = [e for e in struct.iter_unpack("<4sIII", data[:len(data) // 16 * 16])
+               if AVI_STREAM_RE.fullmatch(e[0])]
+    if not entries:
+        problems.append("the index (idx1) is empty")
+        return problems
+    if len(entries) < len(chunks) * 0.98 - 2:
+        problems.append(f"the index lists only {len(entries)} of the {len(chunks)} chunks in the file")
+
+    def points_ok(base, e):
+        q = base + e[2]
+        return 0 <= q and q + 8 <= size and bytes(buf[q:q + 4]) == e[0] and u32le(buf, q + 4) == e[3]
+    # offsets are normally relative to the 'movi' tag, but some writers use file offsets
+    base = next((b for b in (movi[0], 0) if points_ok(b, entries[0])), None)
+    step = max(1, len(entries) // 200)
+    sample = entries[::step] + [entries[-1]]
+    bad = len(sample) if base is None else sum(not points_ok(base, e) for e in sample)
+    if bad > max(1, len(sample) // 100):
+        problems.append("the index points to the wrong places in the file")
+    return problems
+
+
 def avi_stream_codec(st: dict) -> Optional[str]:
     names = []
     strf = st.get("strf", b"")
@@ -1485,8 +1585,6 @@ class Salvager:
                 self.log("  Using the stream settings from the reference video")
                 hdr = self.ref.avi
                 streams = hdr["streams"]
-        if buf.rfind(b"idx1", max(0, size - (64 << 20)), size) < 0:
-            self.log("  Problem found: the AVI index (idx1) is missing - recording was probably interrupted")
 
         videos = {}   # stream no -> dict(file, frames, codec, last)
         audios = {}   # stream no -> WavWriter
@@ -1620,7 +1718,7 @@ def trusted_and_healthy(buf, size: int, ctype: str, data: Optional[dict], err: s
         regions, moov, notes = mp4_layout(buf, size)
         return bool(moov) and len(notes) == 0
     if ctype == "avi":
-        return buf.rfind(b"idx1", max(0, size - (64 << 20)), size) >= 0
+        return not avi_index_problems(buf, size)
     return False
 
 
@@ -1652,11 +1750,13 @@ def out_path_for(src: Path, opts: Options, ext: str) -> Path:
 
 
 def try_direct(src: Path, size: int, vcodec: Optional[str], opts: Options, tools: Tools,
-               log: Log, expected: float) -> Optional[Result]:
+               log: Log, expected: float, ignore_index: bool = False) -> Optional[Result]:
     log("Step 1: rebuilding the file with ffmpeg (tolerant mode)...")
     out_args, ext = encoder_args(opts.copy, vcodec)
     out = out_path_for(src, opts, ext)
-    args = ["-err_detect", "ignore_err", "-fflags", "+genpts+discardcorrupt+igndts",
+    # with a broken index, read the data chunk by chunk instead of trusting the index
+    flags = "+genpts+discardcorrupt+igndts" + ("+ignidx" if ignore_index else "")
+    args = ["-err_detect", "ignore_err", "-fflags", flags,
             "-analyzeduration", "100M", "-probesize", "100M", "-i", str(src),
             "-map", "0:v:0", "-map", "0:a:0?"] + out_args + [str(out)]
     ok, err = run_ffmpeg(tools, args, log, expected)
@@ -1724,6 +1824,10 @@ def repair_file(src, opts: Options, tools: Tools, log: Log = _console_print,
                               "is gone, so it cannot be repaired. (Card recovery software such as "
                               "PhotoRec may still find it on the SD card.)")
 
+        avi_problems = avi_index_problems(buf, size) if ctype == "avi" else []
+        for problem in avi_problems:
+            log(f"  Problem found: {problem}")
+
         data, err = probe(tools, src)
         has_v, _, in_dur, vcodec = probe_summary(data)
         if has_v:
@@ -1732,7 +1836,8 @@ def repair_file(src, opts: Options, tools: Tools, log: Log = _console_print,
             log("ffmpeg cannot open it" + (f": {err.splitlines()[-1]}" if err.strip() else ""))
 
         if opts.skip_healthy and trusted_and_healthy(buf, size, ctype, data, err, vcodec, in_dur):
-            log("  This video looks fine (intact index, plays in Windows) - skipped.")
+            log("  This video looks fine (intact index, plays in Windows) - skipped.\n"
+                "  (If it still won't play, untick 'Skip videos that already look fine' and try again.)")
             return Result(src, True, method="skipped", duration=in_dur, skipped=True,
                           message="looks fine already")
 
@@ -1741,7 +1846,7 @@ def repair_file(src, opts: Options, tools: Tools, log: Log = _console_print,
         trusted = has_v and container_matches(ctype, data)
         direct = None
         if has_v and not opts.deep:
-            direct = try_direct(src, size, vcodec, opts, tools, log, in_dur)
+            direct = try_direct(src, size, vcodec, opts, tools, log, in_dur, bool(avi_problems))
             if direct and (trusted or direct.has_audio):
                 return direct
             if direct:
@@ -1782,7 +1887,7 @@ def repair_file(src, opts: Options, tools: Tools, log: Log = _console_print,
             return direct or salvaged
 
         if has_v and opts.deep:
-            r = try_direct(src, size, vcodec, opts, tools, log, in_dur)
+            r = try_direct(src, size, vcodec, opts, tools, log, in_dur, bool(avi_problems))
             if r:
                 return r
     return Result(src, False, message="Could not recover any playable video from this file.")
@@ -1819,8 +1924,11 @@ def diagnose(src: Path, tools: Tools, log: Log = _console_print) -> None:
             for i, st in enumerate(hdr["streams"]):
                 log(f"  stream {i}: {st.get('type')} {st.get('handler')} codec={avi_stream_codec(st)} "
                     f"rate={st.get('rate')}/{st.get('scale')}")
-            log(f"  movi list: {'found' if buf.find(b'movi', 0, min(size, 8 << 20)) >= 0 else 'missing'}")
-            log(f"  idx1 index: {'found' if buf.rfind(b'idx1', max(0, size - (64 << 20)), size) >= 0 else 'missing'}")
+            problems = avi_index_problems(buf, size)
+            for problem in problems:
+                log(f"  problem: {problem}")
+            if not problems:
+                log("  structure and index: OK")
     data, err = probe(tools, src)
     has_v, has_a, dur, vcodec = probe_summary(data)
     if data:

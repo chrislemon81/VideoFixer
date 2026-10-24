@@ -6,6 +6,7 @@ Run with:  python -m unittest discover -s tests -v
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -187,6 +188,43 @@ class RepairTests(unittest.TestCase):
         truncate(src, 0.85)
         zero_range(src, 0, 4096)
         self.repair(src, DURATION * 0.7)
+
+    # --- AVI whose index exists but is broken (VLC: "the index is not correct") ----------------
+    def avi_with_index(self, name):
+        src = make(self.tmp / name, ["-c:v", "mjpeg", "-q:v", "5"], ["-c:a", "pcm_s16le"])
+        data = bytearray(src.read_bytes())
+        i = data.rfind(b"idx1")
+        return src, data, i, struct.unpack_from("<I", data, i + 4)[0]
+
+    def assert_broken_index_fixed(self, src, problem):
+        r, log = self.repair(src, DURATION * 0.9, skip_healthy=True)
+        self.assertFalse(r.skipped, log)
+        self.assertIn(problem, log)
+
+    def test_avi_index_cut_off(self):
+        src, data, i, n = self.avi_with_index("cut_index.avi")
+        src.write_bytes(data[:i + 8 + n // 3])            # power lost while writing the index
+        self.assert_broken_index_fixed(src, "the index (idx1) is cut off")
+
+    def test_avi_index_wrong_offsets(self):
+        src, data, i, n = self.avi_with_index("bad_offsets.avi")
+        for k in range(i + 8, i + 8 + n, 16):
+            struct.pack_into("<I", data, k + 8, struct.unpack_from("<I", data, k + 8)[0] * 7 & 0xFFFFFFFF)
+        src.write_bytes(data)
+        self.assert_broken_index_fixed(src, "the index points to the wrong places")
+
+    def test_avi_index_incomplete(self):
+        src, data, i, n = self.avi_with_index("short_index.avi")
+        m = n // 3 // 16 * 16
+        new = data[:i] + b"idx1" + struct.pack("<I", m) + data[i + 8:i + 8 + m]
+        struct.pack_into("<I", new, 4, len(new) - 8)
+        src.write_bytes(new)
+        self.assert_broken_index_fixed(src, "the index lists only")
+
+    def test_good_avi_is_skipped(self):
+        src = make(self.tmp / "good_skip.avi", ["-c:v", "mjpeg", "-q:v", "5"], ["-c:a", "pcm_s16le"])
+        r = vf.repair_file(src, vf.Options(out_dir=self.tmp / "out", skip_healthy=True), self.tools, lambda m: None)
+        self.assertTrue(r.skipped)
 
     def test_copy_mode(self):
         src = make(self.tmp / "copy.avi", ["-c:v", "mjpeg"], ["-c:a", "pcm_s16le"])
