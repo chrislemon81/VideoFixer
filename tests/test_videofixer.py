@@ -232,6 +232,24 @@ class RepairTests(unittest.TestCase):
         r, _ = self.repair(src, DURATION * 0.9, copy=True)
         self.assertEqual(r.out.suffix, ".avi")
 
+    # --- start of the file overwritten by unrelated data (damaged file system) ----------------
+    def test_avi_start_overwritten(self):
+        src = make(self.tmp / "DSCF0008.AVI", ["-c:v", "mjpeg", "-q:v", "3", "-s", "1280x720"],
+                   ["-c:a", "pcm_s16le"])
+        data = bytearray(src.read_bytes())
+        cut = len(data) // 3
+        data[:cut] = os.urandom(cut)
+        src.write_bytes(data)
+        r, log = self.repair(src, DURATION * 0.55)
+        self.assertIn("AVI video data", log)
+
+    def test_chk_fragment_from_chkdsk(self):
+        src = make(self.tmp / "frag.avi", ["-c:v", "mjpeg", "-q:v", "5"], ["-c:a", "pcm_s16le"])
+        data = src.read_bytes()
+        chk = self.tmp / "FILE0001.CHK"           # a middle piece of a video, no header at all
+        chk.write_bytes(data[len(data) // 4: len(data) * 3 // 4])
+        self.repair(chk, DURATION * 0.4)
+
     # --- hopeless files ----------------------------------------------------------------------
     def test_all_zero_file(self):
         src = self.tmp / "zeros.mp4"
@@ -245,6 +263,7 @@ class RepairTests(unittest.TestCase):
         src.write_bytes(os.urandom(2_000_000))
         r = vf.repair_file(src, vf.Options(out_dir=self.tmp / "out"), self.tools, lambda m: None)
         self.assertFalse(r.ok)
+        self.assertIn("No video data is left", r.message)
 
 
 if __name__ == "__main__":

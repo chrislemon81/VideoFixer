@@ -50,6 +50,7 @@ Log = Callable[[str], None]
 VIDEO_EXTS = {
     ".avi", ".mp4", ".mov", ".m4v", ".3gp", ".mkv", ".mts", ".m2ts", ".ts",
     ".mpg", ".mpeg", ".wmv", ".asf", ".lrv",
+    ".chk",     # pieces of files saved by Windows "Scan and fix" (chkdsk) in FOUND.000
 }
 
 STANDARD_FPS = (10, 12, 15, 20, 23.976, 24, 25, 29.97, 30, 48, 50, 59.94, 60, 100, 119.88, 120)
@@ -1275,6 +1276,82 @@ def sniff_frame_codec(frame: bytes) -> Optional[str]:
 # Container detection / diagnosis
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# File map: what kind of data is where (for files whose start is damaged)
+# ---------------------------------------------------------------------------
+
+MAP_AVI, MAP_MJPEG, MAP_TS = "AVI video data", "Motion-JPEG frames", "MPEG-TS packets"
+MAP_ANNEXB, MAP_H264, MAP_HEVC = "H.264 stream", "H.264 frames (MP4-style)", "H.265 frames (MP4-style)"
+MAP_MP4 = "MP4/MOV structure"
+MAP_ZEROS, MAP_ERASED, MAP_TEXT, MAP_OTHER = "empty (zeros)", "empty (erased)", "text", "unrecognised data"
+ANNEXB_RE = re.compile(rb"\x00\x00\x01[\x65\x45\x25\x41\x21\x01\x67\x47\x27]")
+
+
+def classify_window(buf, s: int, e: int) -> str:
+    chunk = bytes(buf[s:e])
+    n = len(chunk)
+    if not n or chunk.count(0) > 0.98 * n:
+        return MAP_ZEROS
+    if chunk.count(0xFF) > 0.98 * n:
+        return MAP_ERASED
+    avi = 0
+    for m in AVI_STREAM_RE.finditer(chunk):
+        p = s + m.start()
+        sz = u32le(buf, p + 4) if p + 8 <= len(buf) else AVI_MAX_CHUNK + 1
+        q = p + 8 + sz
+        if sz <= AVI_MAX_CHUNK and q <= len(buf) and (q >= e or _avi_id_ok(buf, q + (sz & 1), len(buf))
+                                                      or _avi_id_ok(buf, q, len(buf))):
+            avi += 1
+            if avi >= 2:
+                return MAP_AVI
+    p = chunk.find(b"\xff\xd8\xff")
+    if p >= 0 and jpeg_end(buf, s + p, len(buf)):
+        return MAP_MJPEG
+    for start in range(min(n, 192)):
+        if chunk[start] == 0x47:
+            for stride in (188, 192):
+                marks = chunk[start::stride][:2000]
+                if len(marks) >= 20 and marks.count(0x47) > 0.9 * len(marks):
+                    return MAP_TS
+    if any(tag in chunk for tag in (b"mdat", b"moov", b"ftyp")):
+        return MAP_MP4
+    probe_sc = NalScanner("h264")
+    starts = sum(1 for m in ANNEXB_RE.finditer(chunk)
+                 if probe_sc._kind(chunk[m.end() - 1:m.end() + 12].ljust(13, b"\0"), True, False))
+    if starts >= 8:
+        return MAP_ANNEXB
+    for codec, label in (("h264", MAP_H264), ("hevc", MAP_HEVC)):
+        sc = NalScanner(codec)
+        sc.scan(buf, s, e)
+        if sc.frames >= 4 and sc.video_bytes > 0.5 * n and sc.limit < sc.MAX_NAL:
+            return label
+    if sum(32 <= c < 127 or c in (9, 10, 13) for c in chunk[:4096]) > 0.95 * min(n, 4096):
+        return MAP_TEXT
+    return MAP_OTHER
+
+
+def file_map(buf, size: int, samples: int = 64, window: int = 1 << 20) -> List[Tuple[int, int, str]]:
+    """Sample the file from start to end -> [(start, end, label)], neighbouring parts merged."""
+    samples = max(1, min(samples, size // window))       # each sample at least `window` long
+    bounds = [size * i // samples for i in range(samples + 1)]
+    out: List[Tuple[int, int, str]] = []
+    for a, b in zip(bounds, bounds[1:]):
+        if b <= a:
+            continue
+        label = classify_window(buf, a, min(b, a + window))
+        if out and out[-1][2] == label:
+            out[-1] = (out[-1][0], b, label)
+        else:
+            out.append((a, b, label))
+    return out
+
+
+def format_map(fmap: List[Tuple[int, int, str]]) -> str:
+    def mb(x):
+        return f"{x / (1 << 20):.1f}"
+    return "\n".join(f"    {mb(a):>8} - {mb(b):>8} MB: {label}" for a, b, label in fmap)
+
+
 def detect_container(buf, size: int) -> str:
     head = bytes(buf[:min(size, 16)])
     if head[:4] == b"RIFF" and head[8:12] in (b"AVI ", b"AVIX"):
@@ -1444,12 +1521,37 @@ class Salvager:
         a = own_a or self.ref.audio
         return self.salvage_payload(regions, v, a)
 
-    def salvage_generic(self) -> Optional[Salvaged]:
+    def salvage_generic(self, codec: Optional[str] = None) -> Optional[Salvaged]:
         regions = [(0, self.size)]
-        v = VideoInfo()
-        if self.ref.video:
-            v = VideoInfo(codec=self.ref.video.codec, extradata=self.ref.video.extradata, fps=self.ref.video.fps)
+        v = VideoInfo(codec=codec)
+        rv = self.ref.video
+        if rv:
+            v.fps = rv.fps
+            if codec in (None, rv.codec):
+                v.codec, v.extradata = rv.codec, rv.extradata
         return self.salvage_payload(regions, v, self.ref.audio)
+
+    def salvage_by_map(self, fmap, tried: str) -> Optional[Salvaged]:
+        """Choose the repair from what the file map shows, wherever in the file it is."""
+        found = Counter()
+        for a, b, label in fmap:
+            found[label] += b - a
+        if found[MAP_AVI] and tried != "avi":
+            self.log("  AVI video data found further into the file - rebuilding from it")
+            r = self.salvage_avi()
+            if r:
+                return r
+        if found[MAP_MJPEG] or found[MAP_AVI]:
+            return self.salvage_generic("mjpeg")
+        if found[MAP_ANNEXB]:
+            fps, why = self._fps(self.ref.video.fps if self.ref.video else None)
+            return Salvaged(self.path, "h264", "h264", fps, 0, notes=[f"frame rate {fps:.3g} ({why})"])
+        if found[MAP_H264] or found[MAP_HEVC]:
+            return self.salvage_generic("h264" if found[MAP_H264] >= found[MAP_HEVC] else "hevc")
+        if tried == "mp4" or found[MAP_MP4]:
+            return self.salvage_generic()
+        self.log("  No video data was recognised anywhere in this file.")
+        return None
 
     def sniff(self, regions) -> Optional[str]:
         s, e = max(regions, key=lambda r: r[1] - r[0])
@@ -1750,15 +1852,17 @@ def out_path_for(src: Path, opts: Options, ext: str) -> Path:
 
 
 def try_direct(src: Path, size: int, vcodec: Optional[str], opts: Options, tools: Tools,
-               log: Log, expected: float, ignore_index: bool = False) -> Optional[Result]:
+               log: Log, expected: float, ignore_index: bool = False,
+               input_format: Optional[str] = None) -> Optional[Result]:
     log("Step 1: rebuilding the file with ffmpeg (tolerant mode)...")
     out_args, ext = encoder_args(opts.copy, vcodec)
     out = out_path_for(src, opts, ext)
     # with a broken index, read the data chunk by chunk instead of trusting the index
     flags = "+genpts+discardcorrupt+igndts" + ("+ignidx" if ignore_index else "")
-    args = ["-err_detect", "ignore_err", "-fflags", flags,
-            "-analyzeduration", "100M", "-probesize", "100M", "-i", str(src),
-            "-map", "0:v:0", "-map", "0:a:0?"] + out_args + [str(out)]
+    args = ["-err_detect", "ignore_err", "-fflags", flags, "-analyzeduration", "100M", "-probesize", "100M"]
+    if input_format:
+        args += ["-f", input_format]
+    args += ["-i", str(src), "-map", "0:v:0", "-map", "0:a:0?"] + out_args + [str(out)]
     ok, err = run_ffmpeg(tools, args, log, expected)
     good, dur, has_a = check_output(tools, out) if ok else (False, 0.0, False)
     if good and dur < 1.0 and size > (10 << 20):
@@ -1853,6 +1957,7 @@ def repair_file(src, opts: Options, tools: Tools, log: Log = _console_print,
                 log("  ffmpeg had to guess the file format, so a deep scan will be tried as well.")
 
         log("Step 2: scanning the raw data for video frames and audio...")
+        fail_msg = "Could not recover any playable video from this file."
         tmp = Path(tempfile.mkdtemp(prefix=".videofixer_", dir=str(out_dir)))
         salvaged = None
         try:
@@ -1863,10 +1968,20 @@ def repair_file(src, opts: Options, tools: Tools, log: Log = _console_print,
                 result = sv.salvage_mp4()
             else:
                 result = None
-            if result is None and ctype != "avi" and avi_resync(buf, 0, min(size, 4 << 20)) < min(size, 4 << 20):
-                result = sv.salvage_avi()       # AVI data without a recognisable header
-            if result is None and ctype != "mp4":
-                result = sv.salvage_generic()
+            if result is None:
+                # the start of the file may be damaged: look at what is where in the whole file
+                log("  Mapping the contents of the file...")
+                fmap = file_map(buf, size)
+                log(format_map(fmap))
+                if any(label == MAP_TS for _, _, label in fmap) and not direct:
+                    direct = try_direct(src, size, None, opts, tools, log, 0.0, input_format="mpegts")
+                if not direct:
+                    result = sv.salvage_by_map(fmap, ctype)
+                    if result is None and all(label in (MAP_OTHER, MAP_ZEROS, MAP_ERASED, MAP_TEXT)
+                                              for _, _, label in fmap):
+                        fail_msg = ("No video data is left in this file: its contents were probably "
+                                    "overwritten or belong to another file. Card recovery software such as "
+                                    "PhotoRec may still find the video on the SD card.")
             if result:
                 for n in result.notes:
                     log(f"  Note: {n}")
@@ -1890,6 +2005,7 @@ def repair_file(src, opts: Options, tools: Tools, log: Log = _console_print,
             r = try_direct(src, size, vcodec, opts, tools, log, in_dur, bool(avi_problems))
             if r:
                 return r
+        return Result(src, False, message=fail_msg)
     return Result(src, False, message="Could not recover any playable video from this file.")
 
 
@@ -1929,6 +2045,10 @@ def diagnose(src: Path, tools: Tools, log: Log = _console_print) -> None:
                 log(f"  problem: {problem}")
             if not problems:
                 log("  structure and index: OK")
+        log("  first bytes: " + bytes(buf[:32]).hex(" "))
+        log("  contents map:\n" + format_map(file_map(buf, size)))
+    if not tools.ok:
+        return
     data, err = probe(tools, src)
     has_v, has_a, dur, vcodec = probe_summary(data)
     if data:
@@ -2059,8 +2179,29 @@ def run_gui(initial=()) -> int:
             lb.delete(i)
             del files[i]
 
+    def diagnose_files():
+        nonlocal tools
+        chosen = [files[i] for i in lb.curselection()] or list(files)
+        if not chosen:
+            messagebox.showinfo("VideoFixer", "Add one or more videos first.")
+            return
+        if not tools.ok:
+            tools = Tools()
+        go.configure(state="disabled")
+
+        def work():
+            for f in chosen:
+                try:
+                    diagnose(f, tools, lambda m: msgs.put(("log", m)))
+                except Exception as e:
+                    msgs.put(("log", f"Could not examine {f}: {e!r}"))
+            msgs.put(("log", "\n(You can select this text, copy it and send it to whoever is helping you.)"))
+            msgs.put(("done", []))
+        threading.Thread(target=work, daemon=True).start()
+
     for text, cmd in (("Add files...", add_files), ("Add folder...", add_folder),
-                      ("Remove", remove), ("Clear", lambda: (lb.delete(0, "end"), files.clear()))):
+                      ("Remove", remove), ("Clear", lambda: (lb.delete(0, "end"), files.clear())),
+                      ("Diagnose", diagnose_files)):
         ttk.Button(bf, text=text, command=cmd, width=14).pack(fill="x", pady=2)
 
     ttk.Label(main, text="2. Optional: a GOOD video from the same camera (helps with MP4/MOV files)",
@@ -2110,6 +2251,12 @@ def run_gui(initial=()) -> int:
     bar.grid(row=0, column=1, sticky="ew", padx=8)
     ttk.Button(act, text="Open output folder",
                command=lambda: open_folder(Path(out_var.get()))).grid(row=0, column=2)
+
+    def copy_log():
+        root.clipboard_clear()
+        root.clipboard_append(logbox.get("1.0", "end").strip())
+
+    ttk.Button(act, text="Copy log", command=copy_log).grid(row=0, column=3, padx=(8, 0))
 
     logbox = scrolledtext.ScrolledText(main, height=12, state="disabled", wrap="word")
     logbox.grid(row=8, column=0, sticky="nsew")

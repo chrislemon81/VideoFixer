@@ -71,7 +71,30 @@ Videos that already look fine are skipped automatically (you can untick that).
 | "The file contains only zeros" | The video data isn't in the file at all. The card's file table points at empty space. A card-recovery tool such as [PhotoRec](https://www.cgsecurity.org/wiki/PhotoRec) (free) may find the lost video on the card itself. |
 | MP4 fixed but silent | That camera records AAC sound, which can't be rebuilt without the index. The picture is still recovered. [untrunc](https://github.com/anthwlock/untrunc) may also recover the sound. |
 
-The text box in the window shows exactly what was found and fixed in each file.
+The text box in the window shows exactly what was found and fixed in each file. For a
+file that won't fix, select it and click **Diagnose**, then **Copy log**. The report
+includes a map of what kind of data sits where in the file.
+
+## If the SD card itself is damaged
+
+When the start of a file holds the wrong data ("unrecognised data" at the top of the map),
+the card's file system is damaged: the file points to the wrong places on the card.
+
+1. **Stop using the card.** Don't record on it, format it, or run Windows' *Scan and fix*
+   yet.
+2. **Make a full copy (image) of the card** with a free tool such as
+   [HDD Raw Copy Tool](https://hddguru.com/software/HDD-Raw-Copy-Tool/) or Win32 Disk Imager.
+   Everything after this can then be tried safely on the copy.
+3. **Run [PhotoRec](https://www.cgsecurity.org/wiki/PhotoRec)** (free) on the card or the
+   image. It ignores the damaged file system and finds videos by their contents, often
+   including pieces that no longer belong to any file. Put what it finds through
+   VideoFixer.
+4. Only then let Windows **Scan and fix** the card (`chkdsk X: /f`). It saves orphaned
+   pieces as `FOUND.000\FILE0000.CHK`. VideoFixer accepts `.CHK` files, and they often
+   contain the missing parts of videos.
+5. Finally, **test the card** with [H2testw](https://www.heise.de/download/product/h2testw-50539)
+   *after* your videos are safe. Cheap cards are often fake: they report more space than
+   they have and silently overwrite old recordings, which causes exactly this kind of damage.
 
 ---
 
