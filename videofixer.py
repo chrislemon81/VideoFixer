@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import mmap
 import os
 import queue
@@ -1169,6 +1170,21 @@ def avi_index_problems(buf, size: int) -> List[str]:
     return problems
 
 
+def describe_avi_header(hdr: dict) -> str:
+    parts = []
+    for st in hdr["streams"]:
+        strf = st.get("strf", b"")
+        if st.get("type") == b"vids":
+            size = f" {u32le(strf, 4)}x{abs(struct.unpack_from('<i', strf, 8)[0])}" if len(strf) >= 12 else ""
+            fps = avi_fps(st, hdr.get("us_per_frame", 0))
+            tag = (strf[16:20] if len(strf) >= 20 else st.get("handler", b"")).decode("latin-1").strip("\0 ")
+            parts.append(f"video {avi_stream_codec(st) or '?'} ({tag}){size}" + (f" @ {fps:.3g} fps" if fps else ""))
+        elif st.get("type") == b"auds" and len(strf) >= 16:
+            tag, ch, rate = struct.unpack_from("<HHI", strf, 0)
+            parts.append(f"audio format 0x{tag:04x}, {rate} Hz, {ch} ch, {u16le(strf, 14)}-bit")
+    return "; ".join(parts) or "no streams"
+
+
 def avi_stream_codec(st: dict) -> Optional[str]:
     names = []
     strf = st.get("strf", b"")
@@ -1282,9 +1298,24 @@ def sniff_frame_codec(frame: bytes) -> Optional[str]:
 
 MAP_AVI, MAP_MJPEG, MAP_TS = "AVI video data", "Motion-JPEG frames", "MPEG-TS packets"
 MAP_ANNEXB, MAP_H264, MAP_HEVC = "H.264 stream", "H.264 frames (MP4-style)", "H.265 frames (MP4-style)"
+MAP_ANNEXB_HEVC = "H.265 stream"
 MAP_MP4 = "MP4/MOV structure"
-MAP_ZEROS, MAP_ERASED, MAP_TEXT, MAP_OTHER = "empty (zeros)", "empty (erased)", "text", "unrecognised data"
-ANNEXB_RE = re.compile(rb"\x00\x00\x01[\x65\x45\x25\x41\x21\x01\x67\x47\x27]")
+MAP_ZEROS, MAP_ERASED, MAP_TEXT = "empty (zeros)", "empty (erased)", "text"
+MAP_OTHER, MAP_RANDOM = "unrecognised data", "unrecognised data (random-looking)"
+UNRECOGNISED = (MAP_OTHER, MAP_RANDOM, MAP_ZEROS, MAP_ERASED, MAP_TEXT)
+# 3-byte start code + NAL header of any common H.264 / H.265 unit (validated further below)
+ANNEXB_RE = re.compile(rb"\x00\x00\x01[\x01\x21\x41\x61\x05\x25\x45\x65\x06\x07\x27\x47\x67"
+                       rb"\x08\x28\x48\x68\x09]")
+ANNEXB_HEVC_RE = re.compile(rb"\x00\x00\x01[\x02\x26\x28\x2a\x40\x42\x44\x46\x4e]\x01")
+
+
+def entropy(data: bytes) -> float:
+    """Shannon entropy in bits per byte: 8.0 = completely random (compressed or encrypted data)."""
+    n = len(data)
+    if not n:
+        return 0.0
+    counts = [data.count(bytes((i,))) for i in range(256)]
+    return -sum(c / n * math.log2(c / n) for c in counts if c)
 
 
 def classify_window(buf, s: int, e: int) -> str:
@@ -1315,19 +1346,22 @@ def classify_window(buf, s: int, e: int) -> str:
                     return MAP_TS
     if any(tag in chunk for tag in (b"mdat", b"moov", b"ftyp")):
         return MAP_MP4
-    probe_sc = NalScanner("h264")
-    starts = sum(1 for m in ANNEXB_RE.finditer(chunk)
-                 if probe_sc._kind(chunk[m.end() - 1:m.end() + 12].ljust(13, b"\0"), True, False))
-    if starts >= 8:
-        return MAP_ANNEXB
+    for rx, codec, hlen, label in ((ANNEXB_RE, "h264", 1, MAP_ANNEXB), (ANNEXB_HEVC_RE, "hevc", 2, MAP_ANNEXB_HEVC)):
+        checker = NalScanner(codec)
+        starts = 0
+        for m in rx.finditer(chunk):
+            h = chunk[m.start() + 3:m.start() + 3 + hlen + 12].ljust(hlen + 12, b"\0")
+            starts += checker._kind(h, True, False) is not None
+        if starts >= 8:
+            return label
     for codec, label in (("h264", MAP_H264), ("hevc", MAP_HEVC)):
         sc = NalScanner(codec)
         sc.scan(buf, s, e)
-        if sc.frames >= 4 and sc.video_bytes > 0.5 * n and sc.limit < sc.MAX_NAL:
+        if sc.frames >= 6 and sc.video_bytes > 0.3 * n:     # random data gives at most ~2 per MB
             return label
     if sum(32 <= c < 127 or c in (9, 10, 13) for c in chunk[:4096]) > 0.95 * min(n, 4096):
         return MAP_TEXT
-    return MAP_OTHER
+    return MAP_RANDOM if entropy(chunk[:1 << 16]) > 7.9 else MAP_OTHER
 
 
 def file_map(buf, size: int, samples: int = 64, window: int = 1 << 20) -> List[Tuple[int, int, str]]:
@@ -1441,7 +1475,7 @@ def load_reference(path: Path, log: Log) -> Reference:
             + (f" @ {ref.video.fps:.3g} fps" if ref.video.fps else "")
             + (f"; audio {ref.audio.describe}" if ref.audio else ""))
     elif ref.avi and ref.avi["streams"]:
-        log("Reference video: AVI header loaded")
+        log("Reference video: AVI header loaded - " + describe_avi_header(ref.avi))
     else:
         log("Warning: the reference video has no usable header (is it a working video?)")
     return ref
@@ -1531,6 +1565,14 @@ class Salvager:
                 v.codec, v.extradata = rv.codec, rv.extradata
         return self.salvage_payload(regions, v, self.ref.audio)
 
+    def ref_avi_fps(self) -> Optional[float]:
+        avi = self.ref.avi
+        if avi:
+            for st in avi["streams"]:
+                if st.get("type") == b"vids":
+                    return avi_fps(st, avi.get("us_per_frame", 0))
+        return None
+
     def salvage_by_map(self, fmap, tried: str) -> Optional[Salvaged]:
         """Choose the repair from what the file map shows, wherever in the file it is."""
         found = Counter()
@@ -1543,9 +1585,12 @@ class Salvager:
                 return r
         if found[MAP_MJPEG] or found[MAP_AVI]:
             return self.salvage_generic("mjpeg")
-        if found[MAP_ANNEXB]:
-            fps, why = self._fps(self.ref.video.fps if self.ref.video else None)
-            return Salvaged(self.path, "h264", "h264", fps, 0, notes=[f"frame rate {fps:.3g} ({why})"])
+        if found[MAP_ANNEXB] or found[MAP_ANNEXB_HEVC]:
+            raw = "h264" if found[MAP_ANNEXB] >= found[MAP_ANNEXB_HEVC] else "hevc"
+            fps, why = self._fps(self.ref.video.fps if self.ref.video else self.ref_avi_fps())
+            self.log(f"  Raw {raw.upper()} video stream found; rebuilding it (sound can't be separated "
+                     "in this layout)")
+            return Salvaged(self.path, raw, raw, fps, 0, notes=[f"frame rate {fps:.3g} ({why})"])
         if found[MAP_H264] or found[MAP_HEVC]:
             return self.salvage_generic("h264" if found[MAP_H264] >= found[MAP_HEVC] else "hevc")
         if tried == "mp4" or found[MAP_MP4]:
@@ -1977,8 +2022,7 @@ def repair_file(src, opts: Options, tools: Tools, log: Log = _console_print,
                     direct = try_direct(src, size, None, opts, tools, log, 0.0, input_format="mpegts")
                 if not direct:
                     result = sv.salvage_by_map(fmap, ctype)
-                    if result is None and all(label in (MAP_OTHER, MAP_ZEROS, MAP_ERASED, MAP_TEXT)
-                                              for _, _, label in fmap):
+                    if result is None and all(label in UNRECOGNISED for _, _, label in fmap):
                         fail_msg = ("No video data is left in this file: its contents were probably "
                                     "overwritten or belong to another file. Card recovery software such as "
                                     "PhotoRec may still find the video on the SD card.")
@@ -2045,8 +2089,10 @@ def diagnose(src: Path, tools: Tools, log: Log = _console_print) -> None:
                 log(f"  problem: {problem}")
             if not problems:
                 log("  structure and index: OK")
-        log("  first bytes: " + bytes(buf[:32]).hex(" "))
+        if ctype == "avi":
+            log("  header says: " + describe_avi_header(parse_avi_header(buf, size)))
         log("  contents map:\n" + format_map(file_map(buf, size)))
+        fingerprint(buf, size, log)
     if not tools.ok:
         return
     data, err = probe(tools, src)
@@ -2055,6 +2101,35 @@ def diagnose(src: Path, tools: Tools, log: Log = _console_print) -> None:
         log(f"ffprobe: video={vcodec} audio={'yes' if has_a else 'no'} duration={dur:.1f}s")
     if err.strip():
         log("ffprobe messages:\n" + last_lines(err, 6))
+
+
+FINGERPRINTS = [
+    (b"RIFF", "RIFF header"), (b"AVI ", "AVI tag"), (b"movi", "AVI movi"), (b"idx1", "AVI index"),
+    (b"00dc", "AVI video chunk"), (b"01wb", "AVI audio chunk"), (b"\xff\xd8\xff", "JPEG start"),
+    (b"JFIF", "JFIF"), (b"Exif", "Exif"), (b"ftyp", "MP4 ftyp"), (b"mdat", "MP4 mdat"),
+    (b"moov", "MP4 moov"), (b"\x00\x00\x00\x01", "4-byte start code"), (b"\x00\x00\x01", "3-byte start code"),
+    (b"\x47\x40", "TS packet"), (b"PK\x03\x04", "ZIP"), (b"\x89PNG", "PNG"), (b"ID3", "MP3 tag"),
+]
+
+
+def fingerprint(buf, size: int, log: Log) -> None:
+    """Low-level facts about a file, to work out what its data is when nothing is recognised."""
+    samples = max(1, min(64, size // (1 << 20)))
+    starts = [size * i // samples for i in range(samples)]
+    chunks = [bytes(buf[a:a + (1 << 20)]) for a in starts]
+    ents = sorted(entropy(c[:1 << 16]) for c in chunks if c)
+    if ents:
+        log(f"  randomness (8.00 = random/compressed): lowest {ents[0]:.2f}, "
+            f"typical {ents[len(ents) // 2]:.2f}, highest {ents[-1]:.2f}")
+    counts = []
+    for sig, name in FINGERPRINTS:
+        n = sum(c.count(sig) for c in chunks)
+        first = buf.find(sig)
+        counts.append(f"{name} x{n}" + (f" (first at {first})" if first >= 0 else ""))
+    log(f"  signatures in {fmt_size(sum(map(len, chunks)))} sampled: " + "; ".join(counts))
+    for frac in (0.0, 0.25, 0.5, 0.75):
+        off = int(size * frac) & ~15
+        log(f"  bytes at {off:>11}: " + bytes(buf[off:off + 32]).hex(" "))
 
 
 def collect_inputs(items) -> List[Path]:

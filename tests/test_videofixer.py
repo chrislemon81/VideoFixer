@@ -250,6 +250,16 @@ class RepairTests(unittest.TestCase):
         chk.write_bytes(data[len(data) // 4: len(data) * 3 // 4])
         self.repair(chk, DURATION * 0.4)
 
+    def test_raw_hevc_stream_after_junk(self):
+        raw = self.tmp / "raw.hevc"
+        subprocess.run([FFMPEG, "-v", "error", "-y", "-f", "lavfi", "-i",
+                        f"testsrc2=size=640x360:rate=30:duration={DURATION}", "-c:v", "libx265",
+                        "-x265-params", "log-level=error", "-f", "hevc", str(raw)], check=True)
+        src = self.tmp / "RAWHEVC.AVI"
+        src.write_bytes(os.urandom(3 << 20) + raw.read_bytes())
+        r, log = self.repair(src, DURATION * 0.9, audio=False)
+        self.assertIn("H.265 stream", log)
+
     # --- hopeless files ----------------------------------------------------------------------
     def test_all_zero_file(self):
         src = self.tmp / "zeros.mp4"
